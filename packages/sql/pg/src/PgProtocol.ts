@@ -756,7 +756,9 @@ const encodeBindUnsafe = (options: Omit<Bind, "_tag">): Uint8Array => {
   const parameters = options.parameters
   const count = requireInt16Count(parameters.length, "Bind parameter")
   const resultFormats = options.resultFormats
-  const resultFormatCodes = resultFormats === undefined ? 1 : resultFormats.length
+  const resultFormatCodes = resultFormats === undefined
+    ? 1
+    : requireInt16Count(resultFormats.length, "Bind result format")
   // Sizing the rest of the frame up front turns every remaining write into a
   // plain store: one bounds check for the message instead of one per field.
   let size = 8 + resultFormatCodes * 2 + count * 4
@@ -945,6 +947,7 @@ export const makeBindEncoder = <A, E = never>(
       }
     }
     const resultFormats = options.resultFormats
+    if (resultFormats !== undefined) requireInt16Count(resultFormats.length, "Bind result format")
     if (resultFormats === undefined) {
       writer.reserve(4)
       const trailer = writer.bytes
