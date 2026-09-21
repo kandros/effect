@@ -1,0 +1,59 @@
+
+=== D. control — same queries through node-postgres (the pre-rc.112 driver) ===
+interval  → OK   object = [object Object]
+point     → OK   object = [object Object]
+money     → OK   string = $1.50
+@effect/sql-pg repro — effect 4.0.0-rc.117, driver: in-house PgConnection
+target: postgres://effect_qb:effect_qb@127.0.0.1:55432/effect_qb_test
+
+=== A. minimal reproduction — unregistered OID (interval, 1186) ===
+interval → FAILED: {
+  "_id": "Cause",
+  "failures": [
+    {
+      "_tag": "Fail",
+      "error": {
+        "_tag": "SqlError",
+        "reason": {
+          "_tag": "UnknownError",
+          "cause": {
+            "message": "Invalid UTF-8 in text value",
+            "_tag": "PgTypesCodecError"
+          },
+          "message": "PgConnection: Failed to decode row",
+          "operation": "query",
+          "~effect/sql/SqlError/Reason": "~effect/sql/SqlError/Reason"
+        },
+        "~effect/sql/SqlError": "~effect/sql/SqlError",
+        "cause": {
+          "_tag": "UnknownError",
+          "cause": {
+            "message": "Invalid UTF-8 in text value",
+            "_tag": "PgTypesCodecError"
+          },
+          "message": "PgConnection: Failed to decode row",
+          "operation": "query",
+          "~effect/sql/SqlError/Reason": "~effect/sql/SqlError/Reason"
+        }
+      }
+    }
+  ]
+}
+
+=== B. same connection after the failure — subsequent queries ===
+select 1 → OK: 1
+
+=== C. result shape matrix (separate fresh statements) ===
+date        (1082) → OK   string = 2026-01-02
+numeric     (1700) → OK   string = 1.25
+time        (1083) → OK   bigint = 45296789012
+timetz      (1266) → OK   bigint = 45296789012
+timestamptz (1184) → OK   object = Fri Jan 02 2026 04:04:05 GMT+0100 (Central European Standard Time)
+bool        (   16) → OK   boolean = true
+int4        (   23) → OK   number = 42
+text        (   25) → OK   string = abc
+uuid        (2950) → OK   string = a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+jsonb       (3802) → OK   object = [object Object]
+interval    (1186) → FAIL Invalid UTF-8 in text value
+point       ( 600) → FAIL Invalid UTF-8 in text value
+money       ( 790) → FAIL Invalid UTF-8 in text value
