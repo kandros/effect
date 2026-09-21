@@ -1125,10 +1125,12 @@ describe("PgTypes", () => {
       }
     })
 
-    it("rejects a text column when the reader is built, not once per row", () => {
+    it("decodes a text column as UTF-8 text, and rejects unknown format codes", () => {
+      const textReader = PgTypesResult.makeFieldReader([{ dataTypeOid: PgTypes.OID.int4, format: 0 }])
+      assert.strictEqual(success(textReader)(Buffer.from("42"), 0, 2), "42")
       assertThrowsTagged(
         "PgTypesCodecError",
-        () => PgTypes.makeFieldReader([{ dataTypeOid: PgTypes.OID.int4, format: 0 }])
+        () => PgTypes.makeFieldReader([{ dataTypeOid: PgTypes.OID.int4, format: 2 }])
       )
     })
 

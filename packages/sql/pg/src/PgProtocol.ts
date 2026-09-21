@@ -194,7 +194,10 @@ export interface Parse {
 
 /**
  * Binds parameter values to a prepared statement and creates a portal.
- * Parameters and results use the binary format.
+ * Parameters use the binary format. Result columns use the binary format
+ * when `resultFormats` is omitted; when provided, it carries one format code
+ * (`0` text, `1` binary) per result column, so columns without a registered
+ * binary codec can be requested as text.
  *
  * @category models
  * @since 4.0.0
@@ -204,6 +207,7 @@ export interface Bind {
   readonly portal: string
   readonly statement: string
   readonly parameters: ReadonlyArray<Uint8Array | null>
+  readonly resultFormats?: ReadonlyArray<number> | undefined
 }
 
 /**
@@ -751,9 +755,11 @@ const encodeBindUnsafe = (options: Omit<Bind, "_tag">): Uint8Array => {
   writer.cString(options.statement)
   const parameters = options.parameters
   const count = requireInt16Count(parameters.length, "Bind parameter")
+  const resultFormats = options.resultFormats
+  const resultFormatCodes = resultFormats === undefined ? 1 : resultFormats.length
   // Sizing the rest of the frame up front turns every remaining write into a
   // plain store: one bounds check for the message instead of one per field.
-  let size = 10 + count * 4
+  let size = 8 + resultFormatCodes * 2 + count * 4
   for (let index = 0; index < count; index++) {
     const parameter = parameters[index]
     if (parameter !== null) size += parameter.length
@@ -792,12 +798,26 @@ const encodeBindUnsafe = (options: Omit<Bind, "_tag">): Uint8Array => {
       offset += length
     }
   }
-  // One result format code, binary, for every column.
-  bytes[offset] = 0
-  bytes[offset + 1] = 1
-  bytes[offset + 2] = 0
-  bytes[offset + 3] = 1
-  writer.offset = offset + 4
+  // Result format codes: one binary code for every column unless the caller
+  // provided per-column codes (binary `1`, text `0`).
+  if (resultFormats === undefined) {
+    bytes[offset] = 0
+    bytes[offset + 1] = 1
+    bytes[offset + 2] = 0
+    bytes[offset + 3] = 1
+    writer.offset = offset + 4
+  } else {
+    bytes[offset] = resultFormatCodes >>> 8
+    bytes[offset + 1] = resultFormatCodes
+    offset += 2
+    for (let index = 0; index < resultFormatCodes; index++) {
+      const code = resultFormats[index]
+      bytes[offset] = code >>> 8
+      bytes[offset + 1] = code
+      offset += 2
+    }
+    writer.offset = offset
+  }
   return end()
 }
 
@@ -870,6 +890,7 @@ export const makeBindEncoder = <A, E = never>(
   readonly portal: string
   readonly statement: string
   readonly parameters: ReadonlyArray<A>
+  readonly resultFormats?: ReadonlyArray<number> | undefined
 }): Result.Result<Uint8Array, EncodeError | E> => {
   try {
     const writer = begin(0x42)
@@ -923,14 +944,23 @@ export const makeBindEncoder = <A, E = never>(
         writer.endLength(token)
       }
     }
-    writer.reserve(4)
-    const trailer = writer.bytes
-    const trailerOffset = writer.offset
-    trailer[trailerOffset] = 0
-    trailer[trailerOffset + 1] = 1
-    trailer[trailerOffset + 2] = 0
-    trailer[trailerOffset + 3] = 1
-    writer.offset = trailerOffset + 4
+    const resultFormats = options.resultFormats
+    if (resultFormats === undefined) {
+      writer.reserve(4)
+      const trailer = writer.bytes
+      const trailerOffset = writer.offset
+      trailer[trailerOffset] = 0
+      trailer[trailerOffset + 1] = 1
+      trailer[trailerOffset + 2] = 0
+      trailer[trailerOffset + 3] = 1
+      writer.offset = trailerOffset + 4
+    } else {
+      writer.reserve(2 + resultFormats.length * 2)
+      writer.int16(resultFormats.length)
+      for (let index = 0; index < resultFormats.length; index++) {
+        writer.int16(resultFormats[index])
+      }
+    }
     return Result.succeed(end())
   } catch (error) {
     if (error instanceof EncodeError) return Result.fail(error)
