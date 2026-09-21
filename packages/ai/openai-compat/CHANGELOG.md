@@ -1,5 +1,13 @@
 # @effect/ai-openai-compat
 
+## 4.0.0-rc.118
+
+### Patch Changes
+
+- [#8333](https://github.com/Effect-TS/effect/pull/8333) [`621a650`](https://github.com/Effect-TS/effect/commit/621a65093d0b687f8cbc4068f69ff0f9417e2da7) Thanks @skusez! - Preserve streamed text and tool arguments when providers send nullable delta fields.
+- Updated dependencies [[`325e0fb`](https://github.com/Effect-TS/effect/commit/325e0fb66a69705decafacb781e6f9fb45f4f462), [`325e0fb`](https://github.com/Effect-TS/effect/commit/325e0fb66a69705decafacb781e6f9fb45f4f462), [`b8d14d3`](https://github.com/Effect-TS/effect/commit/b8d14d3eed3cc15e939baa660e9800b96144a636), [`c79088d`](https://github.com/Effect-TS/effect/commit/c79088d69372ba533ecd6cacb846a43322c2d075), [`3af6bd0`](https://github.com/Effect-TS/effect/commit/3af6bd0803ebdbc44b75ef82b16daa9a82ffa768)]:
+  - effect@4.0.0-rc.118
+
 ## 4.0.0-rc.117
 
 ### Patch Changes

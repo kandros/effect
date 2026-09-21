@@ -1,5 +1,25 @@
 # effect
 
+## 4.0.0-rc.118
+
+### Patch Changes
+
+- [#8339](https://github.com/Effect-TS/effect/pull/8339) [`325e0fb`](https://github.com/Effect-TS/effect/commit/325e0fb66a69705decafacb781e6f9fb45f4f462) Thanks @tim-smart! - Add data-last forms for selected safe Queue operations and selected Option, TxSemaphore, and AsyncResult APIs
+
+- [#8339](https://github.com/Effect-TS/effect/pull/8339) [`325e0fb`](https://github.com/Effect-TS/effect/commit/325e0fb66a69705decafacb781e6f9fb45f4f462) Thanks @tim-smart! - `TxPriorityQueue.fromIterable(order)(iterable)` passed its arguments to the implementation in the wrong order and produced a queue of `undefined` values; the data-first form was unaffected.
+
+- [#8150](https://github.com/Effect-TS/effect/pull/8150) [`b8d14d3`](https://github.com/Effect-TS/effect/commit/b8d14d3eed3cc15e939baa660e9800b96144a636) Thanks @Tyagiquamar! - Fix `Formatter.formatJson` to include `name` and `message` and preserve enumerable properties when stringifying `Error` instances without `toJSON`.
+  
+  ```ts
+  import { Formatter } from "effect"
+  
+  Formatter.formatJson(new Error("boom")) // now `{"name":"Error","message":"boom"}`, previously `{}`
+  ```
+
+- [#8340](https://github.com/Effect-TS/effect/pull/8340) [`c79088d`](https://github.com/Effect-TS/effect/commit/c79088d69372ba533ecd6cacb846a43322c2d075) Thanks @fubhy! - Add family-aware internet address and multicast interface types to `NetAddress`
+
+- [#8337](https://github.com/Effect-TS/effect/pull/8337) [`3af6bd0`](https://github.com/Effect-TS/effect/commit/3af6bd0803ebdbc44b75ef82b16daa9a82ffa768) Thanks @mugnivenko! - Add PlatformError.isPlatformError guard
+
 ## 4.0.0-rc.117
 
 ### Patch Changes
