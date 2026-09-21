@@ -669,7 +669,14 @@ class PgConnectionImpl implements PgConnection {
             })
           )
         )
-        if (cache === undefined || entry.plan.parses) return awaited
+        if (cache === undefined || entry.plan.parses) {
+          // A describe-only first cycle leaves the statement parsed and its
+          // columns known; the bind cycle follows as its own pipelined entry.
+          if (entry.plan.describeOnly) {
+            return Effect.flatMap(awaited, () => this.pipelineCycle(sql, params, wantRows, cache))
+          }
+          return awaited
+        }
         return retryStale(entry.plan, cache, awaited, () => this.pipelineCycle(sql, params, wantRows, undefined))
       }
     )
@@ -716,6 +723,11 @@ class PgConnectionImpl implements PgConnection {
       return Effect.fail(queryError(cause, "PgConnection: Failed to encode query"))
     }
     const run = runQuery(this, plan, wantRows)
+    if (plan.describeOnly) {
+      // The statement is now parsed and its columns known; bind and execute it
+      // in a follow-up cycle with per-column result formats.
+      return Effect.flatMap(run, () => this.attempt(sql, params, wantRows, cache))
+    }
     if (cache === undefined || plan.parses) return run
     return retryStale(plan, cache, run, () => this.attempt(sql, params, wantRows, undefined))
   }
@@ -959,6 +971,17 @@ const describeExecuteSync: Uint8Array = concat([
   PgProtocol.encodeSync()
 ])
 
+/**
+ * A first-execution cycle: describe the freshly parsed statement under its
+ * name so its column OIDs arrive before anything is bound. The follow-up bind
+ * cycle uses them to request per-column result formats.
+ */
+const describeStatement = (name: string): Uint8Array =>
+  concat([
+    PgProtocol.encodeDescribe({ target: "statement", name }),
+    PgProtocol.encodeSync()
+  ])
+
 /** The same tail for a statement whose columns are already known. */
 const executeSync: Uint8Array = concat([
   PgProtocol.encodeExecute({ portal: "", maxRows: 0 }),
@@ -994,6 +1017,12 @@ interface Plan {
   readonly parses: boolean
   /** Whether the frame carries a `Describe`, so the columns arrive on the wire. */
   readonly describes: boolean
+  /**
+   * Set when the cycle only describes the statement (`Parse` / `Describe`
+   * statement / `Sync`) so the column OIDs are known before anything is
+   * bound; the caller then follows with the bind cycle.
+   */
+  readonly describeOnly: boolean
   /** The statement being filled in or reused, if this execution names one. */
   readonly prepared: Prepared | undefined
   /** Set when the columns were already known, so no `RowDescription` is coming. */
@@ -1018,6 +1047,7 @@ const encodeUnnamed = (
     closes: 0,
     parses: true,
     describes: true,
+    describeOnly: false,
     prepared: undefined,
     description: undefined,
     stale: false
@@ -1061,7 +1091,12 @@ const encodeQuery = (
     // columns nobody has seen yet, so this execution goes unnamed.
     return encodeUnnamed(sql, parameters, parameterTypes, encodeBind)
   }
-  const bind = encodeBind({ portal: "", statement: prepared.name, parameters })
+  const bind = encodeBind({
+    portal: "",
+    statement: prepared.name,
+    parameters,
+    resultFormats: prepared.description?.resultFormats
+  })
   if (EffectResult.isFailure(bind)) throw bind.failure
   const parse = prepared.ready ? undefined : PgProtocol.encodeParse({ name: prepared.name, query: sql, parameterTypes })
   if (parse !== undefined && EffectResult.isFailure(parse)) throw parse.failure
@@ -1075,20 +1110,27 @@ const encodeQuery = (
       closes: closeFrames?.count ?? 0,
       parses: false,
       describes: false,
+      describeOnly: false,
       prepared,
       description: prepared.description,
       stale: false
     }
   }
 
+  // First execution: describe the statement before binding anything, so the
+  // column OIDs are known and the bind can request the binary format only for
+  // columns that have a registered codec. Columns without one are requested
+  // as text, which is what their UTF-8 fallback decoder expects. The follow-up
+  // bind cycle runs once this cycle completes.
   prepared.parsing = true
   return {
     frame: closeFrames === undefined
-      ? concat([parse.success, bind.success, describeExecuteSync])
-      : concat([closeFrames.frames, parse.success, bind.success, describeExecuteSync]),
+      ? concat([parse.success, describeStatement(prepared.name)])
+      : concat([closeFrames.frames, parse.success, describeStatement(prepared.name)]),
     closes: closeFrames?.count ?? 0,
     parses: true,
     describes: true,
+    describeOnly: true,
     prepared,
     description: undefined,
     stale: false
@@ -1206,6 +1248,7 @@ type BindEncoder = (options: {
   readonly portal: string
   readonly statement: string
   readonly parameters: ReadonlyArray<PgTypes.Parameter>
+  readonly resultFormats?: ReadonlyArray<number> | undefined
 }) => EffectResult.Result<Uint8Array, PgProtocol.EncodeError | PgTypes.CodecError>
 
 /**
@@ -1380,7 +1423,16 @@ class QueryMachine implements Consumer {
         return
       case "ParseComplete":
         if (this.phase !== "parse") return this.failDesync(`Unexpected ParseComplete during ${this.phase}`)
-        this.phase = "bind"
+        // A describe-only cycle answers its `Describe` statement next; a full
+        // cycle binds right away.
+        this.phase = this.plan.describeOnly ? "describe" : "bind"
+        return
+      case "ParameterDescription":
+        // Only describe-only cycles carry one, between the `ParseComplete`
+        // and the statement's `RowDescription`.
+        if (this.phase !== "describe" || !this.plan.describeOnly) {
+          return this.failDesync(`Unexpected ParameterDescription during ${this.phase}`)
+        }
         return
       case "BindComplete":
         if (this.phase !== "bind") return this.failDesync(`Unexpected BindComplete during ${this.phase}`)
@@ -1403,7 +1455,7 @@ class QueryMachine implements Consumer {
           prepared.description = description.success
           prepared.ready = true
         }
-        this.phase = "rows"
+        this.phase = this.plan.describeOnly ? "complete" : "rows"
         return
       }
       case "NoData": {
@@ -1413,7 +1465,7 @@ class QueryMachine implements Consumer {
           prepared.description = undefined
           prepared.ready = true
         }
-        this.phase = "rows"
+        this.phase = this.plan.describeOnly ? "complete" : "rows"
         return
       }
       case "DataRow": {
@@ -1557,6 +1609,8 @@ interface Description {
   readonly readField: PgProtocol.FieldReader<unknown>
   readonly rowBuilder: RowBuilder
   readonly resultFields: ReadonlyArray<Field>
+  /** One Bind result format code per column: `1` binary, `0` text. */
+  readonly resultFormats: ReadonlyArray<number>
 }
 
 const emptyFields: ReadonlyArray<Field> = []
@@ -1566,7 +1620,20 @@ const describe = (
   fields: ReadonlyArray<PgProtocol.FieldDescription>,
   registry: PgTypes.Registry | undefined
 ): EffectResult.Result<Description, PgTypes.CodecError> => {
-  const reader = PgTypes.makeFieldReader(fields, registry)
+  // A column runs in the binary format only when its OID has a registered
+  // codec; everything else is requested as text, so the UTF-8 fallback in
+  // `makeFieldReader` receives text bytes rather than binary ones.
+  const resultFormats: Array<number> = new Array(fields.length)
+  const readableFields: Array<PgProtocol.FieldDescription> = new Array(fields.length)
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index]
+    // The code a `Describe` statement echoes is the text default, so it is
+    // replaced with the format this connection will actually request.
+    const binary = PgTypes.hasBinaryCodec(field.dataTypeOid, registry)
+    resultFormats[index] = binary ? 1 : 0
+    readableFields[index] = { ...field, format: resultFormats[index] }
+  }
+  const reader = PgTypes.makeFieldReader(readableFields, registry)
   if (EffectResult.isFailure(reader)) return EffectResult.fail(reader.failure)
   const resultFields: Array<Field> = new Array(fields.length)
   for (let index = 0; index < fields.length; index++) {
@@ -1575,7 +1642,8 @@ const describe = (
   return EffectResult.succeed({
     readField: reader.success,
     rowBuilder: makeRowBuilder(fields),
-    resultFields
+    resultFields,
+    resultFormats
   })
 }
 

@@ -1409,6 +1409,16 @@ const lookupFor = (registry: Registry | undefined): Lookup =>
   registry === undefined ? lookup : getRegistryState(registry).lookup
 
 /**
+ * Checks whether an OID has a binary codec, so a result column of that type
+ * can be requested in the binary format. Unregistered OIDs must be requested
+ * as text (`0`); their values decode as UTF-8 text.
+ *
+ * @category decoding
+ * @since 4.0.0-rc.118
+ */
+export const hasBinaryCodec = (oid: number, registry?: Registry): boolean => lookupFor(registry)(oid) !== undefined
+
+/**
  * Registers a binary codec for an OID the built-in catalogue does not cover,
  * or overrides a built-in one. Registered codecs take precedence.
  *
@@ -1637,7 +1647,12 @@ export const makeFieldReader = (
     const lookup = lookupFor(registry)
     const codecs = columns.map((column, index) => {
       if (column.format !== 1) {
-        return fail(`Only the binary format is supported, column ${index} has format ${column.format}`)
+        if (column.format !== 0) {
+          return fail(`Only the text and binary formats are supported, column ${index} has format ${column.format}`)
+        }
+        // A text-format column has no binary codec; its value decodes as
+        // UTF-8 text below.
+        return undefined
       }
       return lookup(column.dataTypeOid)
     })

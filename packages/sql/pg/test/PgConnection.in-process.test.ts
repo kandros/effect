@@ -78,10 +78,19 @@ const makeSslStream = (reply: "S" | "N", cancel: boolean) => {
   return { socket, writes }
 }
 
-const emptyQueryResult = Buffer.concat([
+/**
+ * Response to a first-execution `Parse` / `Describe` statement / `Sync` cycle:
+ * the statement's columns arrive, nothing is bound or executed yet.
+ */
+const describedQueryResult = Buffer.concat([
   backendMessage("1", Buffer.alloc(0)),
-  backendMessage("2", Buffer.alloc(0)),
   backendMessage("n", Buffer.alloc(0)),
+  readyForQuery
+])
+
+/** Response to a follow-up `Bind` / `Execute` / `Sync` cycle. */
+const bindQueryResult = Buffer.concat([
+  backendMessage("2", Buffer.alloc(0)),
   backendMessage("C", Buffer.from("SELECT 0\0")),
   readyForQuery
 ])
@@ -110,6 +119,42 @@ const frontendPreparedNames = (message: Buffer): ReadonlyArray<string> => {
     offset += 1 + length
   }
   return names
+}
+
+/** Reads the result format codes out of every `Bind` message in one write. */
+const frontendResultFormats = (message: Buffer): ReadonlyArray<number> => {
+  const codes: Array<number> = []
+  let offset = 0
+  while (offset < message.length) {
+    const tag = String.fromCharCode(message[offset])
+    const length = message.readInt32BE(offset + 1)
+    const end = offset + 1 + length
+    if (tag === "B") {
+      let at = offset + 5
+      const skipCString = () => {
+        at = message.indexOf(0, at) + 1
+      }
+      skipCString() // portal
+      skipCString() // statement
+      const parameterCodeCount = message.readInt16BE(at)
+      at += 2 + parameterCodeCount * 2
+      const parameterCount = message.readInt16BE(at)
+      at += 2
+      for (let index = 0; index < parameterCount; index++) {
+        const size = message.readInt32BE(at)
+        at += 4
+        if (size > 0) at += size
+      }
+      const resultCodeCount = message.readInt16BE(at)
+      at += 2
+      for (let index = 0; index < resultCodeCount; index++) {
+        codes.push(message.readInt16BE(at))
+        at += 2
+      }
+    }
+    offset = end
+  }
+  return codes
 }
 
 const consumeFrontend = (
@@ -262,26 +307,40 @@ describe("PgConnection in-process server", () => {
         ])
       )
       const dataRow = backendMessage("D", Buffer.concat([int16(1), int32(field.length), field]))
-      const result = Buffer.concat([
+      // First cycle: `Parse` / `Describe` statement / `Sync`, answered with the
+      // statement's columns and no rows.
+      const described = Buffer.concat([
         backendMessage("1", Buffer.alloc(0)),
-        backendMessage("2", Buffer.alloc(0)),
         rowDescription,
+        readyForQuery
+      ])
+      // Follow-up cycle: `Bind` / `Execute` / `Sync`, answered with the row.
+      const bound = Buffer.concat([
+        backendMessage("2", Buffer.alloc(0)),
         dataRow,
         backendMessage("C", Buffer.from("SELECT 1\0")),
+        readyForQuery
+      ])
+      // The second, different statement gets the same shape but no rows.
+      const boundEmpty = Buffer.concat([
+        backendMessage("2", Buffer.alloc(0)),
+        backendMessage("C", Buffer.from("SELECT 0\0")),
         readyForQuery
       ])
       let writes = 0
       const socket: Duplex = new Duplex({
         read() {},
-        write(_chunk: Buffer, _encoding, callback) {
+        write(chunk: Buffer, _encoding, callback) {
           writes++
           queueMicrotask(() => {
             socket.push(
               writes === 1
                 ? Buffer.concat([authenticationOk, backendKeyData, readyForQuery])
-                : writes === 2
-                ? result
-                : emptyQueryResult
+                : writes === 5
+                ? boundEmpty
+                : frontendTags(chunk).includes("B")
+                ? bound
+                : described
             )
           })
           callback()
@@ -310,8 +369,11 @@ describe("PgConnection in-process server", () => {
           if (writes.length === 1) {
             queueMicrotask(() => socket.push(Buffer.concat([authenticationOk, backendKeyData, readyForQuery])))
           } else {
-            const syncs = frontendTags(message).filter((tag) => tag === "S").length
-            queueMicrotask(() => socket.push(Buffer.concat(Array.from({ length: syncs }, () => emptyQueryResult))))
+            const tags = frontendTags(message)
+            const syncs = tags.filter((tag) => tag === "S").length
+            // Describe cycles complete the statement; bind cycles return rows.
+            const result = tags.includes("B") ? bindQueryResult : describedQueryResult
+            queueMicrotask(() => socket.push(Buffer.concat(Array.from({ length: syncs }, () => result))))
           }
           callback()
         }
@@ -327,9 +389,95 @@ describe("PgConnection in-process server", () => {
         connection.query("SELECT 2")
       ], { concurrency: "unbounded" })
 
-      // Both cycles left in one write, each keeping its own Sync.
-      assert.strictEqual(writes.length, 2)
-      assert.deepStrictEqual(frontendTags(writes[1]), ["P", "B", "D", "E", "S", "P", "B", "D", "E", "S"])
+      // Both statements flush their describe cycles in one write, then both
+      // bind cycles in a second write, each keeping its own Sync.
+      assert.strictEqual(writes.length, 3)
+      assert.deepStrictEqual(frontendTags(writes[1]), ["P", "D", "S", "P", "D", "S"])
+      assert.deepStrictEqual(frontendTags(writes[2]), ["B", "E", "S", "B", "E", "S"])
+    }))
+
+  it.effect("requests text format for columns whose OIDs have no registered codec", () =>
+    Effect.gen(function*() {
+      // An OID the built-in catalogue does not cover, like `interval` before a
+      // codec is registered for it.
+      const unregisteredOid = 99999
+      const writes: Array<Buffer> = []
+      const bindResultFormats: Array<ReadonlyArray<number>> = []
+      const socket: Duplex = new Duplex({
+        read() {},
+        write(chunk: Buffer, _encoding, callback) {
+          const message = Buffer.from(chunk)
+          writes.push(message)
+          if (writes.length === 1) {
+            queueMicrotask(() => socket.push(Buffer.concat([authenticationOk, backendKeyData, readyForQuery])))
+            return callback()
+          }
+          const tags = frontendTags(message)
+          if (!tags.includes("B")) {
+            // Describe cycle: one binary-capable column and one whose OID has
+            // no codec.
+            const rowDescription = backendMessage(
+              "T",
+              Buffer.concat([
+                int16(2),
+                Buffer.from("n\0"),
+                int32(0),
+                int16(0),
+                int32(23),
+                int16(4),
+                int32(-1),
+                int16(0),
+                Buffer.from("v\0"),
+                int32(0),
+                int16(0),
+                int32(unregisteredOid),
+                int16(-1),
+                int32(-1),
+                int16(0)
+              ])
+            )
+            queueMicrotask(() =>
+              socket.push(Buffer.concat([
+                backendMessage("1", Buffer.alloc(0)),
+                rowDescription,
+                readyForQuery
+              ]))
+            )
+            return callback()
+          }
+          bindResultFormats.push(frontendResultFormats(message))
+          const dataRow = backendMessage(
+            "D",
+            Buffer.concat([
+              int16(2),
+              int32(4),
+              Buffer.from([0, 0, 0, 42]),
+              int32(9),
+              Buffer.from("some text")
+            ])
+          )
+          queueMicrotask(() =>
+            socket.push(Buffer.concat([
+              backendMessage("2", Buffer.alloc(0)),
+              dataRow,
+              backendMessage("C", Buffer.from("SELECT 1\0")),
+              readyForQuery
+            ]))
+          )
+          callback()
+        }
+      })
+      const connection = yield* PgConnection.make({ username: "test", stream: () => socket })
+
+      const query = "SELECT 42 AS n, 'some text' AS v"
+      const rows = (yield* connection.query(query)).rows
+      assert.deepStrictEqual(rows, [{ n: 42, v: "some text" }])
+
+      // The replayed execution keeps requesting the same formats.
+      const replayed = (yield* connection.query(query)).rows
+      assert.deepStrictEqual(replayed, [{ n: 42, v: "some text" }])
+
+      assert.deepStrictEqual(bindResultFormats, [[1, 0], [1, 0]])
     }))
 
   it.effect("uses distinct prepared statement names across connections", () =>
@@ -345,7 +493,9 @@ describe("PgConnection in-process server", () => {
               socket.push(
                 connectionWrites.length === 1
                   ? Buffer.concat([authenticationOk, backendKeyData, readyForQuery])
-                  : emptyQueryResult
+                  : frontendTags(chunk).includes("B")
+                  ? bindQueryResult
+                  : describedQueryResult
               )
             })
             callback()
@@ -378,7 +528,9 @@ describe("PgConnection in-process server", () => {
           if (writes.length === 1) {
             queueMicrotask(() => socket.push(Buffer.concat([authenticationOk, backendKeyData, readyForQuery])))
           } else {
-            queueMicrotask(() => socket.push(emptyQueryResult))
+            queueMicrotask(() =>
+              socket.push(frontendTags(message).includes("B") ? bindQueryResult : describedQueryResult)
+            )
           }
           callback()
         }
@@ -394,7 +546,11 @@ describe("PgConnection in-process server", () => {
       yield* Effect.promise(() => new Promise<void>((resolve) => queueMicrotask(resolve)))
       yield* connection.query("SELECT 1")
 
-      assert.strictEqual(writes.length, 2)
+      // Startup, the describe cycle of the reused statement, then its bind
+      // cycle.
+      assert.strictEqual(writes.length, 3)
+      assert.deepStrictEqual(frontendTags(writes[1]), ["P", "D", "S"])
+      assert.deepStrictEqual(frontendTags(writes[2]), ["B", "E", "S"])
       const names = frontendPreparedNames(writes[1])
       assert.strictEqual(names.length, 1)
       assert.match(names[0], /^effect_[0-9a-f]{16}_1$/)
